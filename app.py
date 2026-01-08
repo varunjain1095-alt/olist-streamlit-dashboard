@@ -2,115 +2,72 @@ import streamlit as st
 import duckdb
 import pandas as pd
 
-# --------------------------------------------------
-# Page configuration
-# --------------------------------------------------
 st.set_page_config(
     page_title="Olist | Monthly Seller Performance",
     layout="wide"
 )
 
-# --------------------------------------------------
-# Title & context
-# --------------------------------------------------
 st.title("Monthly Seller Performance Overview")
-st.caption(
-    "Marketing dashboard showing seller revenue, order volume, "
-    "and delivery risk indicators."
-)
 
-# --------------------------------------------------
-# DuckDB connection (READ-ONLY — IMPORTANT ON WINDOWS)
-# --------------------------------------------------
 @st.cache_resource
 def get_connection():
-    return duckdb.connect("olist.duckdb", read_only=True)
+    return duckdb.connect("olist.duckdb", read_only=False)
 
-# --------------------------------------------------
-# Load base data
-# --------------------------------------------------
 @st.cache_data
 def load_kpis():
     con = get_connection()
-    return con.sql(
-        "SELECT * FROM seller_monthly_kpis"
-    ).df()
+
+    # Create KPI table if it does NOT exist
+    tables = con.sql("SHOW TABLES").df()
+
+    if "seller_monthly_kpis" not in tables["name"].values:
+        con.sql("""
+        CREATE TABLE seller_monthly_kpis AS
+        SELECT
+            i.seller_id,
+            DATE_TRUNC('month', o.order_purchase_timestamp)::date AS order_month,
+            COUNT(DISTINCT o.order_id) AS total_orders,
+            SUM(i.price + i.freight_value) AS total_revenue,
+            AVG(
+                CASE
+                    WHEN o.order_delivered_customer_date > o.order_estimated_delivery_date
+                    THEN 1 ELSE 0
+                END
+            ) AS late_delivery_pct
+        FROM olist_orders o
+        JOIN olist_order_items i
+            ON o.order_id = i.order_id
+        GROUP BY i.seller_id, order_month
+        """)
+
+    return con.sql("SELECT * FROM seller_monthly_kpis").df()
 
 df_kpis = load_kpis()
 
-# --------------------------------------------------
-# Sidebar — Filters
-# --------------------------------------------------
-st.sidebar.header("Filters")
+st.sidebar.header("Month Filter")
 
-available_months = (
-    df_kpis["order_month"]
-    .sort_values()
-    .unique()
-)
+available_months = sorted(df_kpis["order_month"].unique())
+selected_month = st.sidebar.selectbox("Select month", available_months)
 
-selected_month = st.sidebar.selectbox(
-    label="Select month",
-    options=available_months,
-    index=len(available_months) - 1
-)
-
-# --------------------------------------------------
-# Core business logic (UNCHANGED)
-# --------------------------------------------------
 df_month = df_kpis[df_kpis["order_month"] == selected_month].copy()
 df_month["red_flag"] = df_month["late_delivery_pct"] > 0.2
 
-# --------------------------------------------------
-# Section 1 — Top sellers by revenue
-# --------------------------------------------------
 st.subheader("Top Sellers by Revenue")
-
-df_revenue = (
-    df_month
-    .sort_values("total_revenue", ascending=False)
-    .reset_index(drop=True)
-)
-
 st.dataframe(
-    df_revenue[
-        ["seller_id", "total_revenue", "total_orders", "late_delivery_pct"]
-    ],
+    df_month.sort_values("total_revenue", ascending=False),
     use_container_width=True
 )
 
-# --------------------------------------------------
-# Section 2 — Top sellers by order volume
-# --------------------------------------------------
-st.subheader("Top Sellers by Order Volume")
-
-df_orders = (
-    df_month
-    .sort_values("total_orders", ascending=False)
-    .reset_index(drop=True)
-)
-
+st.subheader("Top Sellers by Orders")
 st.dataframe(
-    df_orders[
-        ["seller_id", "total_orders", "total_revenue", "late_delivery_pct"]
-    ],
+    df_month.sort_values("total_orders", ascending=False),
     use_container_width=True
 )
 
-# --------------------------------------------------
-# Section 3 — Red-flagged sellers
-# --------------------------------------------------
-st.subheader("Red-Flagged Sellers (Late Delivery > 20%)")
+st.subheader("Red-Flagged Sellers (>20% Late Delivery)")
+df_red = df_month[df_month["red_flag"]]
 
-df_red_flag = df_month[df_month["red_flag"]].copy()
-
-if df_red_flag.empty:
-    st.success("No sellers breached the late-delivery threshold for this month.")
+if df_red.empty:
+    st.success("No sellers flagged this month.")
 else:
-    st.dataframe(
-        df_red_flag[
-            ["seller_id", "late_delivery_pct", "total_orders", "total_revenue"]
-        ]
-        .sort_values("late_delivery_pct", ascending=False),
-        use_container_width=True
-    )
+    st.dataframe(df_red, use_container_width=True)
